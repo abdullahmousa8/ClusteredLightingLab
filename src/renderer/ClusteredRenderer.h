@@ -20,14 +20,16 @@ class Renderer {
   void Resize(uint32_t width, uint32_t height);
 
   // Records the full frame: gbuffer -> clusters -> cull -> resolve.
-  void RenderFrame(const Mat4& viewProj, const Mat4& view, SoALights& lights,
-                   float timeSeconds);
+  void RenderFrame(const Mat4& viewProj, const Mat4& view, const Mat4& proj,
+                   SoALights& lights, float timeSeconds);
 
   // Reads back the last frame's GPU timings (ms) via a query ring.
   struct Timings { float gbufferMs, buildMs, cullMs, resolveMs, totalMs; };
   Timings LastTimings() const { return timings_; }
 
   uint32_t LightIndexCount() const { return lightIndexCount_; }
+  // Number of 3D clusters in the current viewport's grid (status output).
+  uint32_t ClusterCount() const { return grid_.numClusters(); }
 
  private:
   bool CreateShaders(std::string& err);

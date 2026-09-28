@@ -147,15 +147,25 @@ bool Renderer::CreateTargets(std::string& err) {
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 
-  glGenRenderbuffers(1, &gDepth_);
-  glBindRenderbuffer(GL_RENDERBUFFER, gDepth_);
-  glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT32F, width_, height_);
+  // Depth must be a TEXTURE, not a renderbuffer: the resolve pass reads it
+  // through u_GBufferDepth. Binding a renderbuffer name with glBindTexture
+  // does NOT put the depth data behind a sampler -- it silently creates an
+  // empty texture under that name instead, so every pixel shades with a wrong
+  // reconstructed position and nothing reports an error.
+  glGenTextures(1, &gDepth_);
+  glBindTexture(GL_TEXTURE_2D, gDepth_);
+  glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT32F, width_, height_, 0,
+               GL_DEPTH_COMPONENT, GL_FLOAT, nullptr);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 
   glGenFramebuffers(1, &fbo_);
   glBindFramebuffer(GL_FRAMEBUFFER, fbo_);
   glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, gAlbedo_, 0);
   glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1, GL_TEXTURE_2D, gNormal_, 0);
-  glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, gDepth_);
+  glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, gDepth_, 0);
 
   const GLenum bufs[2] = {GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1};
   glDrawBuffers(2, bufs);
@@ -270,20 +280,21 @@ void Renderer::Resize(uint32_t width, uint32_t height) {
   height_ = height;
   glDeleteTextures(1, &gAlbedo_);
   glDeleteTextures(1, &gNormal_);
-  glDeleteRenderbuffers(1, &gDepth_);
+  glDeleteTextures(1, &gDepth_);
   glDeleteFramebuffers(1, &fbo_);
-  std::string err;
-  UpdateGrid(width, height);
-  CreateTargets(err);
-  // Cluster AABB/grid storage is indexed by the grid dimensions, so rebuild it.
+  // All four buffers are sized by the grid dimensions. Delete them BEFORE
+  // UpdateGrid runs, which recreates the AABB/grid/cone trio at the new size;
+  // deleting afterwards would leak the old buffers, and skipping the cone's
+  // recreation (as an earlier revision did) leaves a deleted name bound to
+  // binding 5 on every later frame. The global index list is rebuilt below
+  // with the new capacity clamp.
   glDeleteBuffers(1, &clusterAabb_);
   glDeleteBuffers(1, &clusterGrid_);
   glDeleteBuffers(1, &clusterCone_);
   glDeleteBuffers(1, &globalIndex_);
-  MakeBuffer(clusterAabb_,
-             static_cast<GLsizeiptr>(grid_.numClusters() * sizeof(Vec4) * 2), nullptr, GL_DYNAMIC_DRAW);
-  MakeBuffer(clusterGrid_, static_cast<GLsizeiptr>(grid_.numClusters() * sizeof(Vec4)),
-             nullptr, GL_DYNAMIC_DRAW);
+  std::string err;
+  UpdateGrid(width, height);
+  CreateTargets(err);
   // Same size clamp as CreateBuffers; a larger window means more clusters.
   GLint maxBlockSize = 0;
   glGetIntegerv(0x90DE /* GL_MAX_SHADER_STORAGE_BLOCK_SIZE */, &maxBlockSize);
@@ -300,7 +311,7 @@ void Renderer::Shutdown() {
   if (fbo_) glDeleteFramebuffers(1, &fbo_);
   if (gAlbedo_) glDeleteTextures(1, &gAlbedo_);
   if (gNormal_) glDeleteTextures(1, &gNormal_);
-  if (gDepth_) glDeleteRenderbuffers(1, &gDepth_);
+  if (gDepth_) glDeleteTextures(1, &gDepth_);
   const GLuint bufs[] = {clusterAabb_, clusterGrid_, clusterCone_, globalIndex_,
                          indexCounter_, lightView_, lightColor_, lightSpot_,
                          lightSpotInner_, meshVbo_, meshIbo_};
@@ -316,10 +327,16 @@ void Renderer::Shutdown() {
   buildProg_ = cullProg_ = gbufProg_ = shadeProg_ = 0;
 }
 
-void Renderer::RenderFrame(const Mat4& viewProj, const Mat4& view, SoALights& lights,
-                           float timeSeconds) {
-  Mat4 invViewProj, invView;
-  const bool invOk = viewProj.Inverse(&invViewProj) && view.Inverse(&invView);
+void Renderer::RenderFrame(const Mat4& viewProj, const Mat4& view, const Mat4& proj,
+                           SoALights& lights, float timeSeconds) {
+  // The cluster math is ALL view space (camera at the origin, looking down
+  // -Z), so the reconstructing passes need the inverse of the PROJECTION
+  // alone -- NOT the inverse of view*projection. The tested CPU mirror
+  // (BuildClusterAABBs / ClusterIndexForPixel) is fed inv(Perspective); the
+  // renderer must upload the same matrix, or every cluster AABB and every
+  // reconstructed pixel position is silently wrong.
+  Mat4 invProj;
+  const bool invOk = proj.Inverse(&invProj);
   const GLuint lightCount = lights.Count();
 
   // ---- SoA upload: view-space positions happen ONCE per light, on the CPU,
@@ -359,7 +376,7 @@ void Renderer::RenderFrame(const Mat4& viewProj, const Mat4& view, SoALights& li
   glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, clusterAabb_);
   glUseProgram(buildProg_);
   glUniformMatrix4fv(glGetUniformLocation(buildProg_, "u_InvProjection"), 1, GL_FALSE,
-                     invViewProj.Data());
+                     invProj.Data());
   glUniform2f(glGetUniformLocation(buildProg_, "u_ScreenSize"),
               static_cast<float>(width_), static_cast<float>(height_));
   glUniform1f(glGetUniformLocation(buildProg_, "u_ZNear"), zNear_);
@@ -380,27 +397,31 @@ void Renderer::RenderFrame(const Mat4& viewProj, const Mat4& view, SoALights& li
   glUniform1ui(glGetUniformLocation(cullProg_, "u_ClusterCount"), grid_.numClusters());
   glUniform1ui(glGetUniformLocation(cullProg_, "u_MaxLightsPerCluster"), maxLightsPerCluster_);
 
-  // Collect results from the previous frame so we never stall the pipeline.
+  // Collect results from a previous frame so we never stall the pipeline.
+  // If that query is still in flight, skip timing THIS frame: ending a
+  // non-active query (what an earlier revision did on the else path) is
+  // GL_INVALID_OPERATION on every occurrence, and re-beginning a query whose
+  // result was not yet retrieved is not portable either.
+  bool timeThisFrame = true;
   if (queryPending_) {
-    GLuint64 elapsed = 0;
     GLint avail = 0;
     glGetQueryObjectiv(query_, GL_QUERY_RESULT_AVAILABLE, &avail);
     if (avail) {
+      GLuint64 elapsed = 0;
       glGetQueryObjectui64v(query_, GL_QUERY_RESULT, &elapsed);
       timings_.cullMs = static_cast<float>(elapsed) * 1e-6f;
       queryPending_ = false;
     } else {
-      // Result not back yet: close the previous query without opening a new
-      // one, otherwise glEndQuery below would be unpaired (GL_INVALID_OPERATION).
-      glEndQuery(GL_TIME_ELAPSED);
-      queryPending_ = false;
+      timeThisFrame = false;
     }
   }
-  glBeginQuery(GL_TIME_ELAPSED, query_);
-  queryPending_ = true;
+  if (timeThisFrame) {
+    glBeginQuery(GL_TIME_ELAPSED, query_);
+    queryPending_ = true;
+  }
 
   glDispatchCompute(grid_.gridSizeX, grid_.gridSizeY, grid_.gridSizeZ);
-  glEndQuery(GL_TIME_ELAPSED);
+  if (timeThisFrame) glEndQuery(GL_TIME_ELAPSED);
   glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
 
   // ---- Pass 4: deferred resolve
@@ -422,7 +443,7 @@ void Renderer::RenderFrame(const Mat4& viewProj, const Mat4& view, SoALights& li
   glUniform1i(glGetUniformLocation(shadeProg_, "u_GBufferNormal"), 1);
   glUniform1i(glGetUniformLocation(shadeProg_, "u_GBufferDepth"), 2);
   glUniformMatrix4fv(glGetUniformLocation(shadeProg_, "u_InvViewProj"), 1, GL_FALSE,
-                     invViewProj.Data());
+                     invProj.Data());
   glUniform2f(glGetUniformLocation(shadeProg_, "u_ScreenSize"),
               static_cast<float>(width_), static_cast<float>(height_));
   glUniform1f(glGetUniformLocation(shadeProg_, "u_ZNear"), zNear_);
