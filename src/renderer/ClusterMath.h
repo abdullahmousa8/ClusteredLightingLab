@@ -62,20 +62,32 @@ void PrintDepthSlices(const ClusterGridConfig& grid);
 // True if the view-space point lies inside the cluster's AABB (with slack).
 bool PointInCluster(const ClusterAABB& c, Vec3 p, float slack);
 
-// Back-face culling against the cluster's normal cone.
+// Normal cone, for back-face culling against a cluster's surfaces.
 //
-// The paper notes that if every surface in a cluster faces away from a light,
-// the light contributes nothing there and can be dropped, which it reports as a
-// large reduction in tight geometry. The cone is an aggregate over the G-buffer,
-// so this is only a HEURISTIC: it is used to skip work, and any error shows up
-// as slightly wrong lighting, never as a crash.
+// axis    : the direction the cluster's normals predominantly face.
+// mindp   : cos(halfAngle) of the narrowest cone containing every normal, i.e.
+//           min over the cluster's normals of dot(axis, n). Equals 1 when all
+//           normals coincide.
+// uncullable : true when the normals span more than ~168 degrees, so no cone
+//           can contain them and the cluster must never be back-face culled.
 //
-// A cluster with no geometry (no cone recorded) must never be culled, so
-// callers pass a flag rather than a default cone.
+// IMPORTANT: the quantity the cull test needs is sin(halfAngle), NOT mindp.
+// The two are equal only at 45 degrees, and using mindp directly culls lit
+// surfaces for any cone wider than 45 degrees. Call BuildNormalCone to derive
+// these correctly rather than filling them in by hand.
 struct NormalCone {
-  Vec3 axis;      // average normal direction
-  float cutoff;   // cos of the half-angle; >= 1 means "unknown, keep everything"
+  Vec3 axis;
+  float mindp = 1.0f;
+  bool uncullable = true;
 };
+
+// sin(halfAngle) = sqrt(1 - mindp^2). This, not mindp, is the cull threshold.
+float NormalConeCutoff(const NormalCone& cone);
+
+// Builds a cone from the cluster's surface normals. Returns a cone marked
+// uncullable if the normals are too spread out, so an empty or incoherent
+// cluster is never wrongly culled.
+NormalCone BuildNormalCone(const Vec3* normals, uint32_t count);
 
 // True when the light cannot possibly light this cluster, so it may be skipped.
 bool ClusterFacesAwayFrom(const NormalCone& cone, Vec3 toLight);

@@ -379,64 +379,130 @@ int main() {
           "the cone follows the aim direction, not a fixed axis");
   }
 
-  // ---- 8. Back-face culling never drops a light that actually contributes ---
+  // ---- 9. Normal cone: the cutoff must be sin(halfAngle), not mindp -------
   //
-  // This optimisation is only safe if it is CONSERVATIVE. If it culls a cluster
-  // while some surface in it still has N.L > 0, that surface goes unlit. So the
-  // test asserts the one-sided property: never cull when a lit surface exists.
+  // The cull threshold is sin(halfAngle) = sqrt(1 - mindp^2). Storing mindp
+  // directly is wrong for every cone other than 45 degrees, and for cones
+  // WIDER than 45 degrees it over-culls surfaces that are still lit. The
+  // constructed cases below make that difference explicit.
   {
-    Rng rng(0x5EED1234u);
-    int unsafe = 0;
-    for (int iter = 0; iter < 200000; ++iter) {
-      // Build a cluster cone from a few random normals, the way a real
-      // G-buffer reduction would.
-      lab::Vec3 sum{0.0f, 0.0f, 0.0f};
-      const int n = 1 + static_cast<int>(rng.next() % 6u);
-      for (int k = 0; k < n; ++k) {
-        const lab::Vec3 nr{rng.range(-1.0f, 1.0f), rng.range(-1.0f, 1.0f),
-                           rng.range(-1.0f, 1.0f)};
-        const float l = std::sqrt(nr.x * nr.x + nr.y * nr.y + nr.z * nr.z);
-        if (l < 1e-6f) continue;
-        sum.x += nr.x / l; sum.y += nr.y / l; sum.z += nr.z / l;
+    // A cone of normals with half-angle exactly 60 degrees about +Y.
+    const float half = 1.0471975512f;  // 60 deg
+    const lab::NormalCone wide{{0.0f, 1.0f, 0.0f}, std::cos(half), false};
+    const float sinHalf = lab::NormalConeCutoff(wide);
+    Check(std::fabs(sinHalf - std::sin(half)) < 1e-5f,
+          "cutoff equals sin(halfAngle)");
+    Check(std::fabs(sinHalf - wide.mindp) > 0.1f,
+          "cutoff is clearly NOT mindp for a 60-degree cone (the old bug)");
+
+    // Prove the old formula culls a surface that is genuinely lit.
+    // The normals span 60 degrees about +Y, so a surface at the cone's edge
+    // (60 deg off-axis) is still lit while the light is up to 150 degrees
+    // off-axis: edge angle = lightAngle - 60, which must stay under 90.
+    //
+    // At 130 degrees: cos = -0.643.
+    //   old cutoff mindp = cos(60) = 0.5  -> culls when cos < -0.5  -> CULLS
+    //   new cutoff sin(60) = 0.866         -> culls when cos < -0.866 -> keeps
+    // and the edge normal at 70 degrees from the light is still lit (cos > 0).
+    const float lightAngle = 2.2689280276f;  // 130 deg
+    const lab::Vec3 toLight{std::sin(lightAngle), std::cos(lightAngle), 0.0f};
+    const lab::Vec3 edge{std::sin(lightAngle - half), std::cos(lightAngle - half), 0.0f};
+    const bool edgeLit = (edge.x * toLight.x + edge.y * toLight.y + edge.z * toLight.z) > 0.0f;
+    Check(edgeLit, "the cone's edge normal is genuinely lit at 130 degrees");
+
+    Check(!lab::ClusterFacesAwayFrom(wide, toLight),
+          "the corrected cone does NOT cull a light that still lights its edge");
+
+    // The old formula would have culled it. This is the regression guard: if
+    // someone reintroduces mindp as the cutoff, the property test above starts
+    // dropping lit surfaces.
+    const float oldCutoff = wide.mindp;  // the bug: mindp used as the cutoff
+    const float cosLight = toLight.x * wide.axis.x + toLight.y * wide.axis.y +
+                           toLight.z * wide.axis.z;
+    const bool oldWouldCull = cosLight < -oldCutoff;
+    Check(oldWouldCull,
+          "using mindp as the cutoff WOULD wrongly cull this lit case");
+
+    // A 30-degree cone, where the two formulas are closer but still differ.
+    const float half30 = 0.5235987756f;
+    const lab::NormalCone narrow{{0.0f, 1.0f, 0.0f}, std::cos(half30), false};
+    Check(std::fabs(lab::NormalConeCutoff(narrow) - std::sin(half30)) < 1e-5f,
+          "cutoff for a 30-degree cone is sin, not cos");
+  }
+
+  // ---- 10. Building a cone from real normals is conservative -------------
+  //
+  // The real safety property: for any light direction, if some normal in the
+  // cluster has N.L > 0, the cone must NOT be culled. Tested against the actual
+  // normals, not against the cone's own numbers, so it cannot be fooled by a
+  // wrong formula.
+  {
+    Rng rng(0xC0FFEE01u);
+    int unsafe = 0, culled = 0, total = 0;
+    for (int iter = 0; iter < 20000; ++iter) {
+      // A coherent set of normals: a cone of a given half-angle about +Y.
+      const float half = rng.range(0.05f, 1.2f);  // up to ~69 deg
+      const uint32_t n = 1 + static_cast<uint32_t>(rng.next() % 8u);
+      lab::Vec3 normals[8];
+      for (uint32_t k = 0; k < n; ++k) {
+        // Spread the normals around a random azimuth at the same polar angle.
+        const float az = rng.range(0.0f, 6.2831853f);
+        const float pol = rng.range(0.0f, half);
+        const float sp = std::sin(pol), cp = std::cos(pol);
+        normals[k] = {sp * std::cos(az), cp, sp * std::sin(az)};
       }
-      const float sl = std::sqrt(sum.x * sum.x + sum.y * sum.y + sum.z * sum.z);
-      if (sl < 1e-6f) continue;
 
-      lab::NormalCone cone;
-      cone.axis = {sum.x / sl, sum.y / sl, sum.z / sl};
-      // A tight cone: half-angle 0 means all normals coincide with the axis.
-      cone.cutoff = 0.0f;
+      const lab::NormalCone cone = lab::BuildNormalCone(normals, n);
+      if (cone.uncullable) continue;  // nothing to prove for these
 
-      // A light somewhere in the cluster.
-      const lab::Vec3 toLight{rng.range(-5.0f, 5.0f), rng.range(-5.0f, 5.0f),
-                              rng.range(-5.0f, 5.0f)};
-      const float ll = std::sqrt(toLight.x * toLight.x + toLight.y * toLight.y +
+      const lab::Vec3 toLight{rng.range(-1.0f, 1.0f), rng.range(-1.0f, 1.0f),
+                              rng.range(-1.0f, 1.0f)};
+      const float l = std::sqrt(toLight.x * toLight.x + toLight.y * toLight.y +
                                  toLight.z * toLight.z);
-      if (ll < 1e-6f) continue;
-      const lab::Vec3 L{toLight.x / ll, toLight.y / ll, toLight.z / ll};
+      if (l < 1e-6f) continue;
+      const lab::Vec3 L{toLight.x / l, toLight.y / l, toLight.z / l};
 
-      // Some surface in the cluster IS lit if the cone axis is not pointing
-      // directly away. With cutoff 0 the cone is a single direction, so a lit
-      // surface exists whenever cos(axis, L) > 0.
-      const bool someSurfaceLit = (cone.axis.x * L.x + cone.axis.y * L.y +
-                                   cone.axis.z * L.z) > 0.0f;
+      // Ground truth: does ANY normal in the cluster face the light?
+      bool anyLit = false;
+      for (uint32_t k = 0; k < n; ++k) {
+        if (normals[k].x * L.x + normals[k].y * L.y + normals[k].z * L.z > 0.0f) {
+          anyLit = true;
+          break;
+        }
+      }
 
-      if (lab::ClusterFacesAwayFrom(cone, toLight) && someSurfaceLit) ++unsafe;
+      ++total;
+      if (lab::ClusterFacesAwayFrom(cone, toLight)) {
+        ++culled;
+        if (anyLit) ++unsafe;
+      }
     }
+    std::printf("  cone test: %d cases, %d culled, %d unsafe\n", total, culled, unsafe);
     Check(unsafe == 0,
-          "back-face culling never culls a cluster that has a lit surface");
+          "a cone never culls a cluster that has a genuinely lit normal");
+    Check(culled > 0, "the cone test actually culls something (it is not a no-op)");
+  }
 
-    // An unknown cone (empty cluster) must never cull.
-    lab::NormalCone unknown{{0.0f, 1.0f, 0.0f}, 1.0f};
-    Check(!lab::ClusterFacesAwayFrom(unknown, {0.0f, -10.0f, 0.0f}),
-          "an empty cluster is never back-face culled");
+  // ---- 11. Wide normal spread is marked uncullable ----------------------
+  {
+    // Two opposite normals: no cone can contain them, so it must be uncullable.
+    const lab::Vec3 opposite[2] = {{0.0f, 1.0f, 0.0f}, {0.0f, -1.0f, 0.0f}};
+    const lab::NormalCone spread = lab::BuildNormalCone(opposite, 2);
+    Check(spread.uncullable, "opposite normals produce an uncullable cone");
+    Check(!lab::ClusterFacesAwayFrom(spread, {0.0f, -10.0f, 0.0f}),
+          "an uncullable cone never culls, whatever the light direction");
 
-    // A light directly opposite the cone axis IS culled.
-    lab::NormalCone tight{{0.0f, 1.0f, 0.0f}, 0.0f};
-    Check(lab::ClusterFacesAwayFrom(tight, {0.0f, -10.0f, 0.0f}),
-          "a light directly behind a tight cone is culled");
-    Check(!lab::ClusterFacesAwayFrom(tight, {0.0f, 10.0f, 0.0f}),
-          "a light in front of the cone is kept");
+    // A tight set of near-identical normals is cullable.
+    const lab::Vec3 tight[3] = {{0.0f, 1.0f, 0.0f}, {0.01f, 1.0f, 0.0f},
+                                {0.0f, 0.99f, 0.02f}};
+    const lab::NormalCone tightCone = lab::BuildNormalCone(tight, 3);
+    Check(!tightCone.uncullable, "near-parallel normals produce a cullable cone");
+    Check(lab::ClusterFacesAwayFrom(tightCone, {0.0f, -10.0f, 0.0f}),
+          "a light behind a tight cone is culled");
+
+    // Empty input stays uncullable.
+    const lab::NormalCone empty = lab::BuildNormalCone(nullptr, 0);
+    Check(empty.uncullable, "an empty cluster is uncullable");
   }
 
   return Finish();

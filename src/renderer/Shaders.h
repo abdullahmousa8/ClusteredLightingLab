@@ -148,11 +148,16 @@ void main() {
   float zMin = lo.z;
   float zMax = hi.z;
 
-  // Back-face cull against the cluster's normal cone. w >= 1.0 means no cone
-  // was recorded, which must never cull.
-  vec4 cone = clusterCones[clusterIndex].axisCutoff;
-  bool coneValid = cone.w < 1.0;
-  vec3 coneAxis = cone.xyz;
+  // Back-face cull against the cluster's normal cone.
+  //   xyz = cone axis, w = cos(halfAngle) = mindp.
+  // The cull threshold is sin(halfAngle) = sqrt(1 - w*w), NOT w itself: the two
+  // agree only at 45 degrees, and using w over-culls lit surfaces for any cone
+  // wider than that. w <= 0.1 marks an incoherent/empty cluster, which must
+  // never cull.
+  vec4 coneRaw = clusterCones[clusterIndex].axisCutoff;
+  bool coneValid = coneRaw.w > 0.1;
+  float coneSin = coneValid ? sqrt(max(0.0, 1.0 - coneRaw.w * coneRaw.w)) : 0.0;
+  vec3 coneAxis = coneRaw.xyz;
 
   if (lti == 0u) s_localCount = 0u;
   barrier();
@@ -174,7 +179,7 @@ void main() {
         vec3 toLight = lo - lr.xyz;              // cluster centre -> light
         float len = length(toLight);
         if (len > 1e-5) {
-          if (dot(toLight / len, coneAxis) < -cone.w) continue;
+          if (dot(toLight / len, coneAxis) < -coneSin) continue;
         }
       }
       if (sphereIntersectsAABB(lr.xyz, lr.w, lo, hi)) {

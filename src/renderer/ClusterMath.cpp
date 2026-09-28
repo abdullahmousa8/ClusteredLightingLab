@@ -239,19 +239,94 @@ uint32_t ClusterIndexForPixel(float fragX, float fragY, float screenW, float scr
 }
 
 bool ClusterFacesAwayFrom(const NormalCone& cone, Vec3 toLight) {
-  // An unknown cone (empty cluster) must never cull anything.
-  if (cone.cutoff >= 1.0f) return false;
+  // An empty or incoherent cluster must never cull: if the normals span more
+  // than ~168 degrees there is no cone, so every light has to be considered.
+  if (cone.uncullable) return false;
 
   const float len = std::sqrt(toLight.x * toLight.x + toLight.y * toLight.y +
                               toLight.z * toLight.z);
   if (len < 1e-6f) return false;
 
-  // toLight points from the cluster toward the light. If even the cone's
-  // best-aligned direction is behind the light, every normal in the cluster
-  // has N.L < 0 and the light cannot contribute.
+  // toLight points from the cluster toward the light. Every normal in the cone
+  // is within halfAngle of the axis, so if the light is more than 90 degrees
+  // off-axis by the cone's own margin, every N.L is negative and the light
+  // cannot contribute.
   const float cosAngle = (toLight.x * cone.axis.x + toLight.y * cone.axis.y +
                           toLight.z * cone.axis.z) / len;
-  return cosAngle < -cone.cutoff;
+  return cosAngle < -NormalConeCutoff(cone);
+}
+
+float NormalConeCutoff(const NormalCone& cone) {
+  // sin(halfAngle), derived from cos(halfAngle) = mindp. Storing mindp here
+  // instead is the classic bug: mindp == sin only at 45 degrees, so a 60-degree
+  // cone would get 0.5 instead of 0.866 and cull surfaces that are still lit.
+  const float t = 1.0f - cone.mindp * cone.mindp;
+  return t <= 0.0f ? 0.0f : std::sqrt(t);
+}
+
+NormalCone BuildNormalCone(const Vec3* normals, uint32_t count) {
+  NormalCone cone;
+  if (!normals || count == 0) return cone;  // uncullable by default
+
+  // Ritter's smallest-enclosing-sphere gives a far better axis than the
+  // arithmetic mean: with a lopsided normal distribution the mean can land
+  // outside the cluster of directions entirely, producing a cone that does not
+  // contain the normals it was built from.
+  //
+  // Start from the pair of normals that are furthest apart: that pair defines a
+  // sphere containing both, and growing it with the remaining points gives a
+  // centre that is a good cone apex.
+  uint32_t i0 = 0, i1 = 0;
+  float best = -1.0f;
+  for (uint32_t i = 0; i < count; ++i) {
+    for (uint32_t j = i + 1; j < count; ++j) {
+      const float d = normals[i].x * normals[j].x + normals[i].y * normals[j].y +
+                      normals[i].z * normals[j].z;
+      if (d < best) { best = d; i0 = i; i1 = j; }
+    }
+  }
+
+  Vec3 centre{normals[i0].x + normals[i1].x,
+              normals[i0].y + normals[i1].y,
+              normals[i0].z + normals[i1].z};
+  // Grow: pull the centre towards anything that lies outside the current
+  // sphere, one pass at a time.
+  for (uint32_t iter = 0; iter < 2; ++iter) {
+    for (uint32_t i = 0; i < count; ++i) {
+      const Vec3& n = normals[i];
+      const float d2 = (n.x - centre.x) * (n.x - centre.x) +
+                       (n.y - centre.y) * (n.y - centre.y) +
+                       (n.z - centre.z) * (n.z - centre.z);
+      const float r2 = (normals[i1].x - normals[i0].x) * (normals[i1].x - normals[i0].x) +
+                       (normals[i1].y - normals[i0].y) * (normals[i1].y - normals[i0].y) +
+                       (normals[i1].z - normals[i0].z) * (normals[i1].z - normals[i0].z);
+      if (d2 > r2 * 0.25f) {
+        const float k = 0.5f;
+        centre.x += (n.x - centre.x) * k;
+        centre.y += (n.y - centre.y) * k;
+        centre.z += (n.z - centre.z) * k;
+      }
+    }
+  }
+
+  const float cl = std::sqrt(centre.x * centre.x + centre.y * centre.y + centre.z * centre.z);
+  if (cl < 1e-6f) return cone;  // degenerate, stay uncullable
+  cone.axis = {centre.x / cl, centre.y / cl, centre.z / cl};
+
+  // mindp = min dot(axis, n) = cos(halfAngle).
+  float mindp = 1.0f;
+  for (uint32_t i = 0; i < count; ++i) {
+    const float d = cone.axis.x * normals[i].x + cone.axis.y * normals[i].y +
+                    cone.axis.z * normals[i].z;
+    if (d < mindp) mindp = d;
+  }
+  cone.mindp = mindp;
+
+  // mindp <= 0.1 means the normals span more than ~168 degrees, so no useful
+  // cone exists. Marking it uncullable is the safe outcome: it costs a little
+  // performance, whereas the alternative is culling visible surfaces.
+  cone.uncullable = mindp <= 0.1f;
+  return cone;
 }
 
 float SpotConeAttenuation(Vec3 L, Vec3 lightDir, float cosOuter, float cosInner) {

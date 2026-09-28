@@ -120,11 +120,11 @@ void Renderer::UpdateGrid(uint32_t width, uint32_t height) {
   const size_t clusters = grid_.numClusters();
   MakeBuffer(clusterAabb_, static_cast<GLsizeiptr>(clusters * sizeof(Vec4) * 2), nullptr, GL_DYNAMIC_DRAW);
   MakeBuffer(clusterGrid_, static_cast<GLsizeiptr>(clusters * sizeof(Vec4)), nullptr, GL_DYNAMIC_DRAW);
-  // Normal cones start as "unknown" (w >= 1), which never culls. The reduction
-  // pass overwrites the clusters that actually contain geometry.
+  // Normal cones start as "incoherent" (w = 0), which never culls, matching the
+  // shader's `coneRaw.w > 0.1` validity test. The reduction pass overwrites the
+  // clusters that actually contain geometry.
   {
     std::vector<float> cones(static_cast<size_t>(clusters) * 4, 0.0f);
-    for (size_t i = 0; i < clusters; ++i) cones[i * 4 + 3] = 2.0f;  // w = 2 -> invalid
     MakeBuffer(clusterCone_, static_cast<GLsizeiptr>(cones.size() * sizeof(float)),
                cones.data(), GL_DYNAMIC_DRAW);
   }
