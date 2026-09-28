@@ -266,6 +266,9 @@ int main() {
           "G-buffer normals use the view rotation, not the projection");
     Check(!Has("lo - lr.xyz"),
           "cull builds the cluster->light direction; the inverted form culls lit surfaces");
+    Check(Has("if (coneRaw.w <= 0.0) n = 0u;"),
+          "empty cluster optimization: skip writing light list if cluster contains no geometry");
+
   }
 
   // ---- 5b. The renderer feeds the GPU the same inv(P) contract ------------

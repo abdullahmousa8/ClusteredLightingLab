@@ -310,6 +310,15 @@ void main() {
     // read s_localIndices / write globalLightIndices out of bounds.
     uint n = min(s_localCount, kMaxLocalLights);
     n = min(n, u_MaxLightsPerCluster);
+
+    // A cluster with no geometry has nothing to shade, so its light list is
+    // never read by the resolve pass. Writing it anyway is pure waste: it burns
+    // index-buffer capacity and counter atomic contention for entries no one
+    // consumes. The cone's w is 0 exactly when the cluster held no surfaces
+    // (build_cones writes a non-zero result only for clusters that did), so that
+    // is the reliable emptiness signal.
+    if (coneRaw.w <= 0.0) n = 0u;
+
     uint offset = atomicAdd(globalIndexBufferCounter, n);
     clusterGrids[clusterIndex].offset = offset;
     clusterGrids[clusterIndex].count  = n;
