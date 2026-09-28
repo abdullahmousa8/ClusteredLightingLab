@@ -1,0 +1,24 @@
+# Build output
+build/
+*.obj
+*.exe
+*.pdb
+*.ilk
+*.lib
+*.log
+
+# MSVC / Visual Studio
+.vs/
+*.user
+*.suo
+*.VC.db
+*.VC.VC.opendb
+
+# Editor / OS noise
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# Nothing else should be ignored: src/ and the build scripts are the project.
