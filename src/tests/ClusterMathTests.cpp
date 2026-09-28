@@ -252,6 +252,54 @@ int main() {
               yLoop != std::string::npos && xLoop != std::string::npos &&
               zLoop < yLoop && yLoop < xLoop,
           "BuildClusterAABBs iterates z outermost, matching the index formula");
+
+    // Normal-cone reduction stage: keep the rules whose violation is silent -
+    // an empty/incoherent cluster must stay "never cull" (w = 0) and every
+    // cluster must be rewritten each frame (stale cones would otherwise decide
+    // the culling). Also keep the G-buffer normals free of the projection's
+    // scale and z flip, since they feed both the shading and the cones.
+    Check(Has("mindp > 0.1"),
+          "cone pass keeps the incoherent-cluster rule (mindp <= 0.1 -> w = 0)");
+    Check(Has("clusterCones[clusterIndex].axisCutoff = result;"),
+          "cone pass writes every cluster exactly once per frame");
+    Check(Has("mat3(u_View)") && !Has("mat3(u_ViewProj)"),
+          "G-buffer normals use the view rotation, not the projection");
+    Check(!Has("lo - lr.xyz"),
+          "cull builds the cluster->light direction; the inverted form culls lit surfaces");
+  }
+
+  // ---- 5b. The renderer feeds the GPU the same inv(P) contract ------------
+  //
+  // Uploading inv(view*projection) where the view-space math needs
+  // inv(projection) is silent: wrong cluster AABBs and wrong reconstructed
+  // positions, with no GL error anywhere. Pin the uploads down here.
+  {
+    std::FILE* rf = nullptr;
+    const char* rcandidates[] = {
+#ifdef LAB_SRC_DIR
+        LAB_SRC_DIR "/renderer/ClusteredRenderer.cpp",
+        LAB_SRC_DIR "\\renderer\\ClusteredRenderer.cpp",
+#endif
+        "src/renderer/ClusteredRenderer.cpp",
+        "..\\src\\renderer\\ClusteredRenderer.cpp",
+    };
+    for (const char* path : rcandidates) {
+      if (fopen_s(&rf, path, "rb") == 0 && rf) break;
+      rf = nullptr;
+    }
+    Check(rf != nullptr, "ClusteredRenderer.cpp is readable from the test");
+    if (rf) {
+      std::string rsrc;
+      char rbuf[4096];
+      size_t rn = 0;
+      while ((rn = std::fread(rbuf, 1, sizeof(rbuf), rf)) > 0) rsrc.append(rbuf, rn);
+      std::fclose(rf);
+      auto HasR = [&](const char* needle) { return rsrc.find(needle) != std::string::npos; };
+      Check(HasR("proj.Inverse(&invProj)"),
+            "renderer derives invProj from the projection (not the combined inverse)");
+      Check(!HasR("invViewProj"),
+            "no upload of a combined view*projection inverse remains");
+    }
   }
 
   // ---- 6. The resolve pass finds the cluster the pixel is actually in ----

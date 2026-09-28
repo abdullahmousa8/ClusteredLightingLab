@@ -83,6 +83,12 @@ bool Renderer::CreateShaders(std::string& err) {
   glDeleteShader(cc);
   if (!buildProg_ || !cullProg_) return false;
 
+  GLuint conc = Compile(GL_COMPUTE_SHADER, kBuildConesComp, err);
+  if (!conc) return false;
+  coneProg_ = Link(conc, 0, "build_cones", err);
+  glDeleteShader(conc);
+  if (!coneProg_) return false;
+
   GLuint gv = Compile(GL_VERTEX_SHADER, kGBufferVert, err);
   GLuint gf = Compile(GL_FRAGMENT_SHADER, kGBufferFrag, err);
   if (!gv || !gf) return false;
@@ -318,13 +324,119 @@ void Renderer::Shutdown() {
   for (GLuint b : bufs) if (b) glDeleteBuffers(1, &b);
   if (meshVao_) glDeleteVertexArrays(1, &meshVao_);
   if (emptyVao_) glDeleteVertexArrays(1, &emptyVao_);
-  const GLuint progs[] = {buildProg_, cullProg_, gbufProg_, shadeProg_};
+  const GLuint progs[] = {buildProg_, cullProg_, coneProg_, gbufProg_, shadeProg_};
   for (GLuint p : progs) if (p) glDeleteProgram(p);
   query_ = 0; fbo_ = 0; gAlbedo_ = 0; gNormal_ = 0; gDepth_ = 0;
   clusterAabb_ = clusterGrid_ = globalIndex_ = indexCounter_ = 0;
   lightView_ = lightColor_ = lightSpot_ = lightSpotInner_ = 0;
   lightView_ = lightColor_ = meshVbo_ = meshIbo_ = meshVao_ = emptyVao_ = 0;
-  buildProg_ = cullProg_ = gbufProg_ = shadeProg_ = 0;
+  buildProg_ = cullProg_ = coneProg_ = gbufProg_ = shadeProg_ = 0;
+}
+
+uint32_t Renderer::ReadLightIndexTotal() {
+  GLuint total = 0;
+  glBindBuffer(GL_SHADER_STORAGE_BUFFER, indexCounter_);
+  glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, sizeof(GLuint), &total);
+  return total;
+}
+
+// Diagnostic helper (used by --conedump): read one cluster's cone plus its
+// light list and print the light directions, mirroring the shader's back-face
+// test, so the actual GPU data can be inspected instead of theorised about.
+void Renderer::DebugDumpConeAndList(uint32_t tx, uint32_t ty) {
+  const size_t stride = static_cast<size_t>(grid_.gridSizeX) * grid_.gridSizeY;
+  for (uint32_t z = 0; z < grid_.gridSizeZ; ++z) {
+    const size_t idx = static_cast<size_t>(tx) + static_cast<size_t>(ty) * grid_.gridSizeX + z * stride;
+    Vec4 cone{};
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, clusterCone_);
+    glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, static_cast<GLintptr>(idx * sizeof(Vec4)),
+                       sizeof(Vec4), &cone);
+    GLuint grid2[2] = {0, 0};
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, clusterGrid_);
+    glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, static_cast<GLintptr>(idx * sizeof(GLuint) * 2),
+                       static_cast<GLsizeiptr>(sizeof(GLuint) * 2), grid2);
+    const GLuint count = grid2[1];
+    if (count == 0u && cone.w == 0.0f) continue;  // print only populated/valid slices
+    Vec4 lo{};
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, clusterAabb_);
+    glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, static_cast<GLintptr>(idx * sizeof(Vec4) * 2),
+                       sizeof(Vec4), &lo);
+    std::printf("  cluster(%u,%u,%u): cone (%.3f,%.3f,%.3f) w=%.4f | offset=%u count=%u | lo=(%.2f,%.2f,%.2f)\n",
+                tx, ty, z, cone.x, cone.y, cone.z, cone.w, grid2[0], count, lo.x, lo.y, lo.z);
+    if (count > 0u) {
+      const GLuint total = lightIndexCount_ < 1u ? 1u : lightIndexCount_;
+      std::vector<Vec4> lightsAll(total, Vec4{});
+      glBindBuffer(GL_SHADER_STORAGE_BUFFER, lightView_);
+      glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0,
+                         static_cast<GLsizeiptr>(total * sizeof(Vec4)), lightsAll.data());
+      std::vector<GLuint> ids(count);
+      glBindBuffer(GL_SHADER_STORAGE_BUFFER, globalIndex_);
+      glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, static_cast<GLintptr>(grid2[0] * sizeof(GLuint)),
+                         static_cast<GLsizeiptr>(count * sizeof(GLuint)), ids.data());
+      size_t neg = 0, pos = 0;
+      float minD = 1e9f, maxD = -1e9f;
+      for (GLuint k = 0; k < count; ++k) {
+        const Vec4& lv = lightsAll[ids[k] % total];
+        const float dx = lv.x - lo.x, dy = lv.y - lo.y, dz = lv.z - lo.z;
+        const float len = std::sqrt(dx * dx + dy * dy + dz * dz);
+        const float d = len > 1e-6f ? (dx * cone.x + dy * cone.y + dz * cone.z) / len : 0.0f;
+        if (d < 0.0f) ++neg; else ++pos;
+        if (d < minD) minD = d;
+        if (d > maxD) maxD = d;
+        if (k < 5u)
+          std::printf("      light %u: (%.2f,%.2f,%.2f) r=%.2f  dot=%.4f\n",
+                      ids[k], lv.x, lv.y, lv.z, lv.w, d);
+      }
+      std::printf("      listed=%u  dot<0: %zu  dot>=0: %zu  (min=%.3f max=%.3f)\n",
+                  count, neg, pos, minD, maxD);
+    }
+  }
+}
+
+bool Renderer::VerifyClusterAABBs(const Mat4& invProj, std::string& err) {
+  const size_t count = static_cast<size_t>(grid_.numClusters());
+  std::vector<Vec4> gpu(count * 2, Vec4{});
+  glBindBuffer(GL_SHADER_STORAGE_BUFFER, clusterAabb_);
+  glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0,
+                     static_cast<GLsizeiptr>(count * 2 * sizeof(Vec4)), gpu.data());
+
+  std::vector<ClusterAABB> cpu(count);
+  lab::BuildClusterAABBs(invProj, static_cast<float>(width_), static_cast<float>(height_),
+      grid_, [&](uint32_t x, uint32_t y, uint32_t z, const ClusterAABB& c) {
+        const size_t idx = static_cast<size_t>(x) +
+                           static_cast<size_t>(y) * grid_.gridSizeX +
+                           static_cast<size_t>(z) * grid_.gridSizeX * grid_.gridSizeY;
+        cpu[idx] = c;
+      });
+
+  size_t mismatches = 0;
+  float worst = 0.0f;
+  for (size_t i = 0; i < count; ++i) {
+    const Vec4& lo = gpu[i * 2 + 0];
+    const Vec4& hi = gpu[i * 2 + 1];
+    const ClusterAABB& c = cpu[i];
+    const float pairs[6][2] = {{lo.x, c.minPoint.x}, {lo.y, c.minPoint.y}, {lo.z, c.minPoint.z},
+                               {hi.x, c.maxPoint.x}, {hi.y, c.maxPoint.y}, {hi.z, c.maxPoint.z}};
+    bool bad = false;
+    for (const auto& v : pairs) {
+      const float d = std::fabs(v[0] - v[1]);
+      const float tol = 1e-3f + 1e-4f * std::fabs(v[1]);
+      if (d > worst) worst = d;
+      if (!(d <= tol)) bad = true;
+    }
+    if (bad) ++mismatches;
+  }
+  if (mismatches != 0) {
+    char buf[192];
+    std::snprintf(buf, sizeof(buf),
+                  "GPU cluster AABBs differ from the CPU reference in %zu of %zu clusters (worst delta %.6f)",
+                  mismatches, count, static_cast<double>(worst));
+    err = buf;
+    return false;
+  }
+  std::printf("AABB verification: all %zu clusters match the CPU reference (worst delta %.6f)\n",
+              count, static_cast<double>(worst));
+  return true;
 }
 
 void Renderer::RenderFrame(const Mat4& viewProj, const Mat4& view, const Mat4& proj,
@@ -369,6 +481,7 @@ void Renderer::RenderFrame(const Mat4& viewProj, const Mat4& view, const Mat4& p
   glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
   glUseProgram(gbufProg_);
   glUniformMatrix4fv(glGetUniformLocation(gbufProg_, "u_ViewProj"), 1, GL_FALSE, viewProj.Data());
+  glUniformMatrix4fv(glGetUniformLocation(gbufProg_, "u_View"), 1, GL_FALSE, view.Data());
   glBindVertexArray(meshVao_);
   glDrawElements(GL_TRIANGLES, static_cast<GLsizei>(meshIndexCount_), GL_UNSIGNED_INT, nullptr);
 
@@ -383,6 +496,30 @@ void Renderer::RenderFrame(const Mat4& viewProj, const Mat4& view, const Mat4& p
   glUniform1f(glGetUniformLocation(buildProg_, "u_ZFar"), zFar_);
   glUniform3uiv(glGetUniformLocation(buildProg_, "u_GridSize"), 1, gridSizeUvec3_);
   glDispatchCompute((grid_.gridSizeX + 7) / 8, (grid_.gridSizeY + 7) / 8, 1);
+  glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+
+  // ---- Pass 2.5: reduce the G-buffer into one normal cone per cluster,
+  // feeding the back-face test of the cull pass. This pass samples the depth
+  // and normal textures, so the gbuffer FBO must be unbound first (sampling a
+  // texture while it is attached to the bound framebuffer is undefined).
+  glBindFramebuffer(GL_FRAMEBUFFER, 0);
+  glMemoryBarrier(GL_TEXTURE_FETCH_BARRIER_BIT);  // gbuffer draws -> texture reads
+  glActiveTexture(GL_TEXTURE0);
+  glBindTexture(GL_TEXTURE_2D, gNormal_);
+  glActiveTexture(GL_TEXTURE0 + 1);
+  glBindTexture(GL_TEXTURE_2D, gDepth_);
+  glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, clusterCone_);
+  glUseProgram(coneProg_);
+  glUniformMatrix4fv(glGetUniformLocation(coneProg_, "u_InvProjection"), 1, GL_FALSE,
+                     invProj.Data());
+  glUniform2f(glGetUniformLocation(coneProg_, "u_ScreenSize"),
+              static_cast<float>(width_), static_cast<float>(height_));
+  glUniform1f(glGetUniformLocation(coneProg_, "u_ZNear"), zNear_);
+  glUniform1f(glGetUniformLocation(coneProg_, "u_ZFar"), zFar_);
+  glUniform3uiv(glGetUniformLocation(coneProg_, "u_GridSize"), 1, gridSizeUvec3_);
+  glUniform1i(glGetUniformLocation(coneProg_, "u_GBufferNormal"), 0);
+  glUniform1i(glGetUniformLocation(coneProg_, "u_GBufferDepth"), 1);
+  glDispatchCompute(grid_.gridSizeX, grid_.gridSizeY, grid_.gridSizeZ);
   glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
 
   // ---- Pass 3: cull lights (one workgroup per cluster)
@@ -442,7 +579,7 @@ void Renderer::RenderFrame(const Mat4& viewProj, const Mat4& view, const Mat4& p
   glUniform1i(glGetUniformLocation(shadeProg_, "u_GBufferAlbedoRoughness"), 0);
   glUniform1i(glGetUniformLocation(shadeProg_, "u_GBufferNormal"), 1);
   glUniform1i(glGetUniformLocation(shadeProg_, "u_GBufferDepth"), 2);
-  glUniformMatrix4fv(glGetUniformLocation(shadeProg_, "u_InvViewProj"), 1, GL_FALSE,
+  glUniformMatrix4fv(glGetUniformLocation(shadeProg_, "u_InvProjection"), 1, GL_FALSE,
                      invProj.Data());
   glUniform2f(glGetUniformLocation(shadeProg_, "u_ScreenSize"),
               static_cast<float>(width_), static_cast<float>(height_));

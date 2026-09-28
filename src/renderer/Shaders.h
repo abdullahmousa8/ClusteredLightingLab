@@ -77,6 +77,116 @@ void main() {
 }
 )GLSL";
 
+// Normal-cone pass: reduce the G-buffer into one cone per cluster (runs
+// between build_clusters and cull_lights). One workgroup per cluster; each of
+// the 64 threads tests ONE pixel of the cluster's tile, keeps it if the
+// reconstructed depth lands in this cluster's z slice, and thread 0 merges
+// the survivors with the exact same Ritter-growth algorithm as the tested CPU
+// reference (ClusterMath.cpp BuildNormalCone), so the two stay in sync.
+//
+// Safety rule, mirroring the reference: an empty or incoherent cluster is
+// written as w = 0 ("never cull"). Covering too little here would make the
+// cull pass drop lights that genuinely light pixels - silent wrong output.
+inline const char* kBuildConesComp = R"GLSL(
+#version 460 core
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+struct ClusterNormalCone { vec4 axisCutoff; };
+
+layout(std430, binding = 0) writeonly buffer ClusterConeBuffer { ClusterNormalCone clusterCones[]; };
+
+uniform mat4 u_InvProjection;
+uniform vec2 u_ScreenSize;
+uniform float u_ZNear;
+uniform float u_ZFar;
+uniform uvec3 u_GridSize;
+uniform sampler2D u_GBufferNormal;
+uniform sampler2D u_GBufferDepth;
+
+shared vec3 s_normals[64];
+shared bool s_valid[64];
+
+vec3 coneViewPosFromDepth(vec2 uv, float depth) {
+  vec4 clip = vec4(uv * 2.0 - 1.0, depth * 2.0 - 1.0, 1.0);
+  vec4 p = u_InvProjection * clip;
+  return p.xyz / p.w;
+}
+
+void main() {
+  const uint lti = gl_LocalInvocationIndex;
+  const uvec2 wg = gl_WorkGroupID.xy;
+  const uint wz = gl_WorkGroupID.z;
+  const uint clusterIndex = wg.x + wg.y * u_GridSize.x + wz * u_GridSize.x * u_GridSize.y;
+
+  // Tile pixel block start, same formula the resolve uses
+  // (fragCoord / (screenSize / gridSize)); a uniform 8x8 read from the block
+  // start covers every pixel the resolve can assign to this cluster (tiles are
+  // at most 8px). A one-pixel over-read at the edge only ever ADDS normals to
+  // the cone, which keeps it conservative.
+  const vec2 tileSize = u_ScreenSize / vec2(u_GridSize.xy);
+  const ivec2 px0 = ivec2(vec2(wg) * tileSize);
+  const ivec2 px = px0 + ivec2(int(lti & 7u), int(lti >> 3u));
+
+  vec3 n = vec3(0.0, 0.0, 1.0);
+  bool valid = false;
+  if (px.x < int(u_ScreenSize.x) && px.y < int(u_ScreenSize.y)) {
+    const vec2 uv = (vec2(px) + 0.5) / u_ScreenSize;
+    const float depth = texture(u_GBufferDepth, uv).r;
+    if (depth < 1.0) {
+      const vec3 P = coneViewPosFromDepth(uv, depth);
+      const float slice = log(-P.z / u_ZNear) / log(u_ZFar / u_ZNear) * float(u_GridSize.z);
+      const uint z = uint(clamp(floor(slice), 0.0, float(u_GridSize.z) - 1.0));
+      if (z == wz) {
+        n = normalize(texture(u_GBufferNormal, uv).xyz);
+        valid = true;
+      }
+    }
+  }
+  s_normals[lti] = n;
+  s_valid[lti] = valid;
+  barrier();
+
+  if (lti == 0u) {
+    vec3 ns[64];
+    uint count = 0u;
+    for (uint i = 0u; i < 64u; ++i)
+      if (s_valid[i]) { ns[count] = s_normals[i]; ++count; }
+
+    // Exact mirror of BuildNormalCone (ClusterMath.cpp): seed with the pair
+    // of normals furthest apart, two Ritter growth passes, then mindp =
+    // min dot(axis, n) over the actual set (exact, so the cone stays safe
+    // even if the axis is not perfectly tight).
+    vec4 result = vec4(0.0);
+    if (count > 0u) {
+      uint i0 = 0u, i1 = 0u;
+      float best = -1.0;
+      for (uint i = 0u; i < count; ++i)
+        for (uint j = i + 1u; j < count; ++j) {
+          const float d = dot(ns[i], ns[j]);
+          if (d < best) { best = d; i0 = i; i1 = j; }
+        }
+      vec3 centre = ns[i0] + ns[i1];
+      const vec3 seed = ns[i1] - ns[i0];
+      const float r2 = dot(seed, seed);
+      for (uint iter = 0u; iter < 2u; ++iter) {
+        for (uint i = 0u; i < count; ++i) {
+          const vec3 diff = ns[i] - centre;
+          if (dot(diff, diff) > r2 * 0.25) centre += diff * 0.5;
+        }
+      }
+      const float cl = length(centre);
+      if (cl > 1e-6) {
+        const vec3 axis = centre / cl;
+        float mindp = 1.0;
+        for (uint i = 0u; i < count; ++i) mindp = min(mindp, dot(axis, ns[i]));
+        if (mindp > 0.1) result = vec4(axis, mindp);
+      }
+    }
+    clusterCones[clusterIndex].axisCutoff = result;
+  }
+}
+)GLSL";
+
 // Pass 2: light culling.
 // One workgroup per CLUSTER, 8x8 = 64 threads (two full warps, no partially
 // masked warp). Lights are streamed in tiles of kLightTileSize through shared
@@ -176,7 +286,11 @@ void main() {
       // it contributes nothing. Conservative: only culls when even the cone's
       // best-aligned direction is behind the light.
       if (coneValid) {
-        vec3 toLight = lo - lr.xyz;              // cluster centre -> light
+        // Direction from the cluster TOWARD the light. The operands must be in
+        // this order: swapped, the pass culls exactly the lights that face the
+        // surface - which is how this line was found broken the first time the
+        // cones stopped being inert.
+        vec3 toLight = lr.xyz - lo;
         float len = length(toLight);
         if (len > 1e-5) {
           if (dot(toLight / len, coneAxis) < -coneSin) continue;
@@ -210,15 +324,19 @@ void main() {
 )GLSL";
 
 
-// G-buffer pass: albedo+roughness in RT0, world normal in RT1.
+// G-buffer pass: albedo+roughness in RT0, view-space normal in RT1.
 inline const char* kGBufferVert = R"GLSL(
 #version 460 core
 layout(location = 0) in vec3 a_Position;
 layout(location = 1) in vec3 a_Normal;
 uniform mat4 u_ViewProj;
+uniform mat4 u_View;
 out vec3 v_Normal;
 void main() {
-  v_Normal = mat3(u_ViewProj) * a_Normal;
+  // Normals transform by the view matrix's rotation part ONLY. Folding the
+  // projection in would mix in its anisotropic scale and z flip, skewing
+  // every shading normal - and the normal cones reduced from this buffer.
+  v_Normal = mat3(u_View) * a_Normal;
   gl_Position = u_ViewProj * vec4(a_Position, 1.0);
 }
 )GLSL";
@@ -255,7 +373,7 @@ layout(std430, binding = 5) readonly buffer LightSpotInner   { vec4 lightSpotInn
 uniform sampler2D u_GBufferAlbedoRoughness;
 uniform sampler2D u_GBufferNormal;
 uniform sampler2D u_GBufferDepth;
-uniform mat4  u_InvViewProj;
+uniform mat4  u_InvProjection;  // inverse of the PROJECTION (view-space math)
 uniform vec2  u_ScreenSize;
 uniform float u_ZNear;
 uniform float u_ZFar;
@@ -263,7 +381,7 @@ uniform uvec3 u_GridSize;
 
 vec3 viewPosFromDepth(vec2 uv, float depth) {
   vec4 clip = vec4(uv * 2.0 - 1.0, depth * 2.0 - 1.0, 1.0);
-  vec4 p = u_InvViewProj * clip;
+  vec4 p = u_InvProjection * clip;
   return p.xyz / p.w;
 }
 

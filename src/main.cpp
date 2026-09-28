@@ -273,8 +273,12 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
   int argc = 0;
   LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
   bool compileOnly = false;
+  bool selfTest = false;
+  bool coneDump = false;
   for (int i = 1; i < argc; ++i) {
     if (std::wcscmp(argv[i], L"--compile-shaders") == 0) compileOnly = true;
+    if (std::wcscmp(argv[i], L"--selftest") == 0) selfTest = true;
+    if (std::wcscmp(argv[i], L"--conedump") == 0) coneDump = true;
   }
 
   if (!haveCompute && !compileOnly) {
@@ -298,9 +302,47 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
   lights.GenerateOrbit(kLightCount, 0.0f, 12.0f);
 
   if (compileOnly) {
-    // Initialize() already compiled and linked all five shaders; reaching here
-    // means every one of them built on this driver.
+    // Initialize() already compiled and linked all shader programs; reaching
+    // here means every one of them built on this driver.
     std::printf("All shaders compiled and linked successfully.\n");
+    renderer.Shutdown();
+    wglMakeCurrent(nullptr, nullptr);
+    wglDeleteContext(rc);
+    ReleaseDC(hwnd, g_hdc);
+    DestroyWindow(hwnd);
+    return 0;
+  }
+
+  if (selfTest || coneDump) {
+    // One frame, then VALUE-level inspection: --selftest compares the GPU-built
+    // cluster AABBs against the CPU reference fed the same inv(projection)
+    // (the regression test for the "wrong matrix uploaded" defect class, which
+    // no screenshot can catch); --conedump prints one cluster's cone plus the
+    // dot statistics of its light list, straight off the GPU buffers.
+    const float aspect = static_cast<float>(kInitialW) / static_cast<float>(kInitialH);
+    const lab::Mat4 view = lab::Mat4::LookAt(22.0f, 9.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+                                             0.0f, 1.0f, 0.0f);
+    const lab::Mat4 proj = lab::Mat4::Perspective(1.0472f, aspect, 0.1f, 100.0f);
+    const lab::Mat4 viewProj = lab::Mat4::Multiply(proj, view);
+    lab::Mat4 invProj;
+    if (!proj.Inverse(&invProj)) {
+      std::fprintf(stderr, "selftest: projection matrix is not invertible\n");
+      return 1;
+    }
+    renderer.RenderFrame(viewProj, view, proj, lights, 0.0f);
+    glFinish();
+    if (selfTest) {
+      std::string verr;
+      if (!renderer.VerifyClusterAABBs(invProj, verr)) {
+        std::fprintf(stderr, "selftest FAILED: %s\n", verr.c_str());
+        renderer.Shutdown();
+        return 1;
+      }
+      std::printf("selftest PASS\n");
+    }
+    if (coneDump) {
+      renderer.DebugDumpConeAndList(80, 45);  // centre tile at the nominal 1280x720
+    }
     renderer.Shutdown();
     wglMakeCurrent(nullptr, nullptr);
     wglDeleteContext(rc);
@@ -345,9 +387,12 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
     if (t - lastReport > 1.0) {
       lastReport = t;
       const auto tm = renderer.LastTimings();
-      std::printf("t=%6.1fs  lights=%u  cull=%5.2fms  total=%5.2fms  clusters=%u\n", t,
+      // The global index counter shows how many lights survived the cull -
+      // the proof that the culling actually does something. One readback per
+      // second: the sync cost is irrelevant at this cadence.
+      std::printf("t=%6.1fs  lights=%u  cull=%5.2fms  total=%5.2fms  clusters=%u  indices=%u\n", t,
                   renderer.LightIndexCount(), tm.cullMs, tm.totalMs,
-                  renderer.ClusterCount());
+                  renderer.ClusterCount(), renderer.ReadLightIndexTotal());
       std::fflush(stdout);
     }
   }

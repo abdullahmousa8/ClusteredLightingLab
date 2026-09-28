@@ -116,6 +116,7 @@ using GLuint64 = unsigned __int64;
   X(PFNGLDELETEBUFFERSPROC, glDeleteBuffers, void, GLsizei, const GLuint*) \
   X(PFNGLBINDBUFFERPROC, glBindBuffer, void, GLenum, GLuint) \
   X(PFNGLBUFFERDATAPROC, glBufferData, void, GLenum, GLsizeiptr, const void*, GLenum) \
+  X(PFNGLGETBUFFERSUBDATAPROC, glGetBufferSubData, void, GLenum, GLintptr, GLsizeiptr, void*) \
   X(PFNGLACTIVETEXTUREPROC, glActiveTexture, void, GLenum) \
   X(PFNGLGENTEXTURESPROC, glGenTextures, void, GLsizei, GLuint*) \
   X(PFNGLBINDTEXTUREPROC, glBindTexture, void, GLenum, GLuint) \
@@ -198,6 +199,7 @@ constexpr GLenum GL_RGBA16F = 0x881A;
 constexpr GLenum GL_R8 = 0x8229;
 constexpr GLenum GL_FRAMEBUFFER_COMPLETE = 0x8CD5;
 constexpr GLenum GL_SHADER_STORAGE_BARRIER_BIT = 0x00002000;
+constexpr GLenum GL_TEXTURE_FETCH_BARRIER_BIT = 0x00000008;
 constexpr GLenum GL_TIME_ELAPSED = 0x88BF;
 constexpr GLenum GL_QUERY_RESULT = 0x8866;
 constexpr GLenum GL_QUERY_RESULT_AVAILABLE = 0x8867;
